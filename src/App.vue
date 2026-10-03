@@ -1,8 +1,27 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { courseForLesson, exportRecords, lessonById, persist, saveAttempt, setDownloaded, state, updateTokenClassification } from './store';
-import type { ErrorCategory, Lesson, PracticeAttempt, PracticeView } from './types';
+import {
+  chooseDraftVersion,
+  courseForLesson,
+  currentAttempts,
+  ensureProgress,
+  exportRecords,
+  exportSyncBundle,
+  getSentenceDraft,
+  importSyncBundle,
+  isAttemptStale,
+  lessonById,
+  persist,
+  saveAttempt,
+  setDownloaded,
+  setSentenceAnswer,
+  setTeacherFeedback,
+  state,
+  updateTokenClassification
+} from './store';
+import type { ErrorCategory, Lesson, PracticeAttempt, PracticeView, SentenceAttempt } from './types';
 import { compareSentence, scoreAttempt, segmentText } from './utils';
+import type { MergeReport } from './sync';
 
 const view = ref<PracticeView>(state.activeLessonId ? 'practice' : 'library');
 const online = ref(navigator.onLine);
@@ -13,6 +32,7 @@ const segmentStart = ref(0);
 const segmentEnd = ref(1);
 const teacherAttemptId = ref(state.attempts[0]?.id ?? '');
 const teacherDraft = ref(state.attempts[0]?.teacherFeedback ?? '');
+const syncFileInput = ref<HTMLInputElement | null>(null);
 let toastTimer = 0;
 
 const activeLesson = computed(() => lessonById(state.activeLessonId));
@@ -23,21 +43,33 @@ const currentSentence = computed(() => {
   return lesson.sentences.find((sentence) => sentence.id === state.activeSentenceId) ?? lesson.sentences[0];
 });
 const activeProgress = computed(() => activeLesson.value ? state.progress[activeLesson.value.id] : undefined);
+const currentDraft = computed(() => {
+  const lesson = activeLesson.value;
+  const sentence = currentSentence.value;
+  return lesson && sentence ? getSentenceDraft(lesson.id, sentence.id) : undefined;
+});
 const currentAnswer = ref('');
 const currentIndex = computed(() => {
   if (!activeLesson.value || !currentSentence.value) return 0;
   return activeLesson.value.sentences.findIndex((item) => item.id === currentSentence.value?.id);
 });
 const lessonCompletion = computed(() => {
-  if (!activeLesson.value || !activeProgress.value) return 0;
-  const answered = activeLesson.value.sentences.filter((sentence) => (activeProgress.value?.answers[sentence.id] ?? '').trim()).length;
+  if (!activeLesson.value) return 0;
+  const answered = activeLesson.value.sentences.filter((sentence) => (activeProgress.value?.sentences[sentence.id]?.value ?? '').trim()).length;
   return Math.round((answered / activeLesson.value.sentences.length) * 100);
 });
+const conflictCount = computed(() => {
+  const lesson = activeLesson.value;
+  if (!lesson || !activeProgress.value) return 0;
+  return lesson.sentences.filter((sentence) => (activeProgress.value?.sentences[sentence.id]?.choices.length ?? 0) > 0).length;
+});
 const resultAttempt = computed(() => state.attempts.find((attempt) => attempt.id === resultAttemptId.value));
+const resultStale = computed(() => (resultAttempt.value ? isAttemptStale(resultAttempt.value) : false));
 const resultSentence = computed(() => resultAttempt.value?.sentenceAttempts[selectedResultSentence.value]);
 const teacherAttempt = computed(() => state.attempts.find((attempt) => attempt.id === teacherAttemptId.value));
-const totalWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).length);
-const correctedWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).filter((token) => !token.correct && token.category !== 'unclassified').length);
+const teacherStale = computed(() => (teacherAttempt.value ? isAttemptStale(teacherAttempt.value) : false));
+const totalWords = computed(() => currentAttempts().flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).length);
+const correctedWords = computed(() => currentAttempts().flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).filter((token) => !token.correct && token.category !== 'unclassified').length);
 
 const categoryOptions: Array<{ value: ErrorCategory; label: string }> = [
   { value: 'unclassified', label: '未分类' },
@@ -49,7 +81,7 @@ const categoryOptions: Array<{ value: ErrorCategory; label: string }> = [
 ];
 
 watch(currentSentence, (sentence) => {
-  currentAnswer.value = sentence && activeProgress.value ? activeProgress.value.answers[sentence.id] ?? '' : '';
+  currentAnswer.value = sentence ? getSentenceDraft(activeLesson.value!.id, sentence.id).value : '';
   segmentStart.value = 0;
   segmentEnd.value = sentence ? Math.max(0, segmentText(sentence.text).length - 1) : 0;
 }, { immediate: true });
@@ -58,22 +90,16 @@ watch(currentAnswer, (value) => {
   const lesson = activeLesson.value;
   const sentence = currentSentence.value;
   if (!lesson || !sentence) return;
-  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: sentence.id, updatedAt: new Date().toISOString() };
-  progress.answers[sentence.id] = value;
-  progress.activeSentenceId = sentence.id;
-  progress.updatedAt = new Date().toISOString();
-  state.progress[lesson.id] = progress;
+  setSentenceAnswer(lesson.id, sentence.id, value);
 });
 
 watch(activeLesson, (lesson) => {
   if (!lesson) return;
+  const progress = ensureProgress(lesson.id, lesson.sentences[0].id);
   state.activeLessonId = lesson.id;
-  state.activeSentenceId = currentSentence.value?.id ?? lesson.sentences[0].id;
-  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: lesson.sentences[0].id, updatedAt: new Date().toISOString() };
   if (!lesson.sentences.some((sentence) => sentence.id === progress.activeSentenceId)) progress.activeSentenceId = lesson.sentences[0].id;
-  state.progress[lesson.id] = progress;
   state.activeSentenceId = progress.activeSentenceId;
-  currentAnswer.value = progress.answers[state.activeSentenceId] ?? '';
+  currentAnswer.value = progress.sentences[state.activeSentenceId]?.value ?? '';
 });
 
 watch(teacherAttemptId, (id) => {
@@ -83,15 +109,14 @@ watch(teacherAttemptId, (id) => {
 function notify(message: string) {
   toast.value = message;
   window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => { toast.value = ''; }, 2400);
+  toastTimer = window.setTimeout(() => { toast.value = ''; }, 2600);
 }
 
 function startLesson(lesson: Lesson) {
-  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: lesson.sentences[0].id, updatedAt: new Date().toISOString() };
-  state.progress[lesson.id] = progress;
+  const progress = ensureProgress(lesson.id, lesson.sentences[0].id);
   state.activeLessonId = lesson.id;
   state.activeSentenceId = progress.activeSentenceId || lesson.sentences[0].id;
-  currentAnswer.value = progress.answers[state.activeSentenceId] ?? '';
+  currentAnswer.value = progress.sentences[state.activeSentenceId]?.value ?? '';
   view.value = 'practice';
   persist();
 }
@@ -106,8 +131,36 @@ function goToSentence(index: number) {
     progress.activeSentenceId = target.id;
     progress.updatedAt = new Date().toISOString();
   }
-  currentAnswer.value = progress?.answers[target.id] ?? '';
+  currentAnswer.value = progress?.sentences[target.id]?.value ?? '';
   window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function pickVersion(index: number) {
+  const lesson = activeLesson.value;
+  const sentence = currentSentence.value;
+  if (!lesson || !sentence) return;
+  chooseDraftVersion(lesson.id, sentence.id, index);
+  currentAnswer.value = getSentenceDraft(lesson.id, sentence.id).value;
+  notify('已选定该版本，冲突已解除');
+}
+
+function buildSentenceAttempts(lesson: Lesson): SentenceAttempt[] {
+  const progress = state.progress[lesson.id];
+  return lesson.sentences.map((sentence) => {
+    const source = sentence.text;
+    const answer = progress?.sentences[sentence.id]?.value ?? '';
+    const tokens = compareSentence(source, answer);
+    const correct = tokens.filter((token) => token.correct).length;
+    return { sentenceId: sentence.id, source, answer, tokens, score: tokens.length ? Math.round((correct / tokens.length) * 100) : 0 };
+  });
+}
+
+function buildSnapshot(lesson: Lesson): Record<string, string> {
+  const snapshot: Record<string, string> = {};
+  lesson.sentences.forEach((sentence) => {
+    snapshot[sentence.id] = state.progress[lesson.id]?.sentences[sentence.id]?.value ?? '';
+  });
+  return snapshot;
 }
 
 function submitLesson() {
@@ -115,19 +168,17 @@ function submitLesson() {
   const course = activeCourse.value;
   if (!lesson || !course) return;
   const progress = state.progress[lesson.id];
-  const answeredCount = lesson.sentences.filter((sentence) => (progress?.answers[sentence.id] ?? '').trim()).length;
+  if (conflictCount.value > 0) {
+    notify(`还有 ${conflictCount.value} 句双设备修改未选择，请先逐句选定版本`);
+    return;
+  }
+  const answeredCount = lesson.sentences.filter((sentence) => (progress?.sentences[sentence.id]?.value ?? '').trim()).length;
   if (!answeredCount) {
     notify('请至少输入一句话再提交');
     return;
   }
   if (answeredCount < lesson.sentences.length && !window.confirm(`还有 ${lesson.sentences.length - answeredCount} 句未作答，仍然提交吗？`)) return;
-  const sentenceAttempts = lesson.sentences.map((sentence) => {
-    const source = sentence.text;
-    const answer = progress?.answers[sentence.id] ?? '';
-    const tokens = compareSentence(source, answer);
-    const correct = tokens.filter((token) => token.correct).length;
-    return { sentenceId: sentence.id, source, answer, tokens, score: tokens.length ? Math.round((correct / tokens.length) * 100) : 0 };
-  });
+  const sentenceAttempts = buildSentenceAttempts(lesson);
   const attempt: PracticeAttempt = {
     id: `attempt-${Date.now()}`,
     lessonId: lesson.id,
@@ -136,7 +187,9 @@ function submitLesson() {
     submittedAt: new Date().toISOString(),
     score: scoreAttempt(sentenceAttempts),
     sentenceAttempts,
-    teacherFeedback: ''
+    teacherFeedback: '',
+    snapshot: buildSnapshot(lesson),
+    schemaVersion: 2
   };
   saveAttempt(attempt);
   resultAttemptId.value = attempt.id;
@@ -145,6 +198,28 @@ function submitLesson() {
   view.value = 'result';
   persist();
   notify('已提交，逐词结果已生成');
+}
+
+/** 答案改动导致旧结果失效后，用当前草稿重新确认一次，重新进入统计与导出。 */
+function reconfirmAttempt() {
+  const attempt = resultAttempt.value;
+  const lesson = attempt ? lessonById(attempt.lessonId) : undefined;
+  if (!attempt || !lesson) return;
+  const stillConflicted = lesson.sentences.some((sentence) => (state.progress[lesson.id]?.sentences[sentence.id]?.choices.length ?? 0) > 0);
+  if (stillConflicted) {
+    notify('仍有句子存在双设备修改，请先在课程中选定版本');
+    return;
+  }
+  const sentenceAttempts = buildSentenceAttempts(lesson);
+  attempt.sentenceAttempts = sentenceAttempts;
+  attempt.score = scoreAttempt(sentenceAttempts);
+  attempt.snapshot = buildSnapshot(lesson);
+  attempt.submittedAt = new Date().toISOString();
+  attempt.teacherFeedback = ''; // 反馈绑定的是旧答案，重新确认后需要教师重新评价
+  selectedResultSentence.value = Math.min(selectedResultSentence.value, sentenceAttempts.length - 1);
+  syncSegment();
+  persist();
+  notify('已按当前答案重新确认，旧反馈已清空待教师重新评价');
 }
 
 function syncSegment() {
@@ -185,7 +260,11 @@ function saveClassification(attemptId: string, sentenceId: string, tokenIndex: n
 function saveTeacherFeedback() {
   const attempt = teacherAttempt.value;
   if (!attempt) return;
-  attempt.teacherFeedback = teacherDraft.value.trim();
+  if (teacherStale.value) {
+    notify('该记录的答案已被改动，学生重新确认后才能写入反馈');
+    return;
+  }
+  setTeacherFeedback(attempt.id, teacherDraft.value.trim());
   persist();
   notify('教师反馈已保存');
 }
@@ -198,15 +277,55 @@ function changeFont(delta: number) {
   state.fontScale = Math.min(1.25, Math.max(0.85, Number((state.fontScale + delta).toFixed(2))));
 }
 
-function downloadRecords() {
-  const blob = new Blob([exportRecords()], { type: 'application/json;charset=utf-8' });
+function downloadText(filename: string, text: string) {
+  const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = url;
-  anchor.download = `echo-step-records-${new Date().toISOString().slice(0, 10)}.json`;
+  anchor.download = filename;
   anchor.click();
   URL.revokeObjectURL(url);
-  notify('练习记录已导出');
+}
+
+function downloadRecords() {
+  downloadText(`echo-step-records-${new Date().toISOString().slice(0, 10)}.json`, exportRecords());
+  notify(`练习记录已导出（不含 ${state.attempts.length - currentAttempts().length} 条失效记录）`);
+}
+
+function downloadSyncBundle() {
+  downloadText(`echo-step-drafts-${state.device.id.slice(4, 10)}-${new Date().toISOString().slice(0, 10)}.json`, exportSyncBundle());
+  notify('同步包已生成，把它发给另一台设备并在那里导入');
+}
+
+function triggerSyncImport() {
+  syncFileInput.value?.click();
+}
+
+function onSyncFileChosen(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const report: MergeReport = importSyncBundle(String(reader.result));
+      if (activeLesson.value && currentSentence.value) {
+        currentAnswer.value = getSentenceDraft(activeLesson.value.id, currentSentence.value.id).value;
+      }
+      if (report.conflicts.length) {
+        notify(`已合并 ${report.sentencesMerged} 句，其中 ${report.conflicts.length} 句两边都改过，请逐句选择`);
+      } else if (report.sentencesMerged) {
+        notify(`已自动接续 ${report.sentencesMerged} 句，未产生冲突`);
+      } else {
+        notify('同步包已导入，没有新的改动');
+      }
+    } catch (error) {
+      notify(error instanceof Error ? error.message : '同步包无法读取');
+    } finally {
+      input.value = '';
+    }
+  };
+  reader.readAsText(file);
 }
 
 function formatDate(value: string): string {
@@ -256,9 +375,9 @@ onBeforeUnmount(() => {
 
         <section class="hero">
           <h2>今天也把声音变成文字</h2>
-          <p>下载课程后可离线作答，答案和当前位置会自动恢复。</p>
+          <p>手机、电脑可分别离线续写同一课，回网后按句合并，两边都改的句子并列等你选择。</p>
           <div class="hero-stats">
-            <div class="hero-stat"><strong>{{ state.attempts.length }}</strong><span>练习记录</span></div>
+            <div class="hero-stat"><strong>{{ currentAttempts().length }}</strong><span>有效记录</span></div>
             <div class="hero-stat"><strong>{{ correctedWords }}</strong><span>已分类错误</span></div>
             <div class="hero-stat"><strong>{{ totalWords }}</strong><span>累计词数</span></div>
           </div>
@@ -266,8 +385,18 @@ onBeforeUnmount(() => {
 
         <div class="offline-banner" :class="{ online }">
           <span>{{ online ? '● 在线 · 数据已保存到本机' : '● 离线模式 · 可继续已下载课程' }}</span>
-          <span>{{ online ? '本地优先存储' : '恢复网络后继续保存' }}</span>
+          <span>本机：{{ state.device.label }}</span>
         </div>
+
+        <section class="panel sync-panel">
+          <div class="dictation-label" style="margin-top:0"><strong>多设备草稿合并</strong><span>逐句向量时钟合并</span></div>
+          <p class="sync-hint">在另一台设备导出同步包，回本设备导入即可：只在一侧改过的句子自动接上；两边都改过的句子并列保留，由你选择；同一设备重复导入不会重复建冲突。</p>
+          <div class="sync-actions">
+            <var-button type="primary" size="small" @click="downloadSyncBundle">生成同步包</var-button>
+            <var-button type="default" variant="outline" size="small" @click="triggerSyncImport">导入同步包</var-button>
+          </div>
+          <input ref="syncFileInput" type="file" accept="application/json,.json" hidden @change="onSyncFileChosen" />
+        </section>
 
         <div class="section-head">
           <h3>课程库</h3>
@@ -291,13 +420,16 @@ onBeforeUnmount(() => {
           </div>
         </article>
 
-        <div class="section-head"><h3>最近练习</h3><span>{{ state.attempts.length }} 条记录</span></div>
+        <div class="section-head"><h3>最近练习</h3><span>{{ currentAttempts().length }} 条有效 / {{ state.attempts.length }} 条总计</span></div>
         <article v-if="state.attempts.length" class="panel">
           <div v-for="attempt in state.attempts.slice(0, 4)" :key="attempt.id" class="history-card">
-            <div class="history-top"><strong>{{ attempt.lessonTitle }}</strong><span class="history-score">{{ attempt.score }} 分</span></div>
-            <p>{{ formatDate(attempt.submittedAt) }} · {{ attempt.teacherFeedback || '暂无教师反馈' }}</p>
+            <div class="history-top">
+              <strong>{{ attempt.lessonTitle }}</strong>
+              <span class="history-score">{{ attempt.score }} 分<span v-if="isAttemptStale(attempt)" class="stale-tag">已失效</span></span>
+            </div>
+            <p>{{ formatDate(attempt.submittedAt) }} · <template v-if="isAttemptStale(attempt)">答案已改动，重新确认前不计入统计</template><template v-else>{{ attempt.teacherFeedback || '暂无教师反馈' }}</template></p>
           </div>
-          <var-button block type="primary" variant="outline" @click="downloadRecords">导出全部练习记录</var-button>
+          <var-button block type="primary" variant="outline" @click="downloadRecords">导出有效练习记录</var-button>
         </article>
         <div v-else class="empty-state"><strong>还没有练习记录</strong>完成一次听写后，可在这里复核和导出。</div>
       </div>
@@ -322,7 +454,16 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
-        <div class="dictation-label"><strong>输入听到的内容</strong><span>答案在本机自动保存</span></div>
+        <section v-if="currentDraft?.choices.length" class="conflict-card">
+          <div class="dictation-label" style="margin:0 0 8px"><strong>这句两台设备都改过</strong><span>请选择保留哪个版本</span></div>
+          <button v-for="(choice, index) in currentDraft.choices" :key="choice.deviceId + '-' + index" class="choice-row" @click="pickVersion(index)">
+            <span class="choice-device">{{ choice.deviceLabel || '另一台设备' }} · {{ formatDate(choice.editedAt) }}</span>
+            <span class="choice-text">{{ choice.value || '（空）' }}</span>
+          </button>
+          <p class="conflict-note">选择前提交会被阻止；你也可以直接在下方改写，视为采用本设备的新版本。</p>
+        </section>
+
+        <div class="dictation-label"><strong>输入听到的内容</strong><span>{{ currentDraft?.choices.length ? '存在待选版本' : '答案在本机自动保存' }}</span></div>
         <textarea v-model="currentAnswer" class="answer-box" :aria-label="`第 ${currentIndex + 1} 句听写答案`" placeholder="Type what you hear..." @keydown.ctrl.enter="submitLesson" @keydown.meta.enter="submitLesson"></textarea>
         <div class="practice-actions">
           <var-button block type="default" variant="outline" @click="replay(currentSentence?.text ?? '')">再听一次</var-button>
@@ -330,8 +471,9 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="sentence-picker" aria-label="句子导航">
-          <button v-for="(sentence, index) in activeLesson.sentences" :key="sentence.id" class="sentence-dot" :class="{ active: sentence.id === currentSentence?.id, done: !!activeProgress?.answers[sentence.id] }" :aria-label="`跳到第 ${index + 1} 句`" @click="goToSentence(index)">{{ index + 1 }}</button>
+          <button v-for="(sentence, index) in activeLesson.sentences" :key="sentence.id" class="sentence-dot" :class="{ active: sentence.id === currentSentence?.id, done: !!(activeProgress?.sentences[sentence.id]?.value), conflict: (activeProgress?.sentences[sentence.id]?.choices.length ?? 0) > 0 }" :aria-label="`跳到第 ${index + 1} 句`" @click="goToSentence(index)">{{ index + 1 }}</button>
         </div>
+        <p v-if="conflictCount" class="conflict-summary">还有 {{ conflictCount }} 句两边都改过，标红的句子需要选定版本。</p>
 
         <section v-if="currentSentence" class="panel">
           <div class="detail-head"><div><h3>场景提示</h3><p>{{ currentSentence.translation }}</p></div></div>
@@ -342,12 +484,19 @@ onBeforeUnmount(() => {
       <div v-else-if="view === 'result' && resultAttempt" class="page">
         <header class="topbar">
           <button class="back-button" aria-label="返回课程库" @click="view = 'library'">‹</button>
-          <span class="status-chip">提交于 {{ formatDate(resultAttempt.submittedAt) }}</span>
+          <span class="status-chip" :class="{ 'status-stale': resultStale }">{{ resultStale ? '结果已失效' : `提交于 ${formatDate(resultAttempt.submittedAt)}` }}</span>
           <button class="icon-button" @click="downloadRecords">导出</button>
         </header>
 
+        <section v-if="resultStale" class="panel stale-panel">
+          <strong>答案在提交后又被改动（或来自另一台设备的合并）</strong>
+          <p>下面的逐词结果和教师反馈绑定的是提交当时的答案，已立即失效，重新确认前不会进入统计和导出。</p>
+          <var-button block type="primary" size="small" @click="reconfirmAttempt">用当前答案重新确认</var-button>
+          <var-button block type="default" variant="outline" size="small" style="margin-top:8px" @click="startLesson(activeLesson!)">返回课程修改</var-button>
+        </section>
+
         <section class="panel result-score">
-          <div class="score-ring" :style="{ '--score': `${resultAttempt.score}%` }"><strong>{{ resultAttempt.score }}</strong></div>
+          <div class="score-ring" :class="{ dimmed: resultStale }" :style="{ '--score': `${resultAttempt.score}%` }"><strong>{{ resultAttempt.score }}</strong></div>
           <h2>{{ resultAttempt.score >= 90 ? '几乎完美' : resultAttempt.score >= 70 ? '继续打磨细节' : '再听一遍会更好' }}</h2>
           <p>{{ resultAttempt.lessonTitle }} · 点击红色词可单独重听，并记录错误原因。</p>
         </section>
@@ -390,7 +539,7 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
-        <section v-if="resultAttempt.teacherFeedback" class="panel"><div class="feedback-card"><strong>教师反馈</strong><p>{{ resultAttempt.teacherFeedback }}</p></div></section>
+        <section v-if="resultAttempt.teacherFeedback" class="panel"><div class="feedback-card" :class="{ 'feedback-stale': resultStale }"><strong>教师反馈{{ resultStale ? '（已失效，对应旧答案）' : '' }}</strong><p>{{ resultAttempt.teacherFeedback }}</p></div></section>
         <var-button block type="primary" @click="startLesson(activeLesson!)">返回本次课程</var-button>
         <var-button block type="default" variant="outline" style="margin-top: 10px" @click="downloadRecords">导出练习记录</var-button>
       </div>
@@ -402,15 +551,16 @@ onBeforeUnmount(() => {
         </header>
 
         <div v-if="state.attempts.length" class="panel">
-          <div class="dictation-label"><strong>选择一次作答</strong><span>{{ state.attempts.length }} 条</span></div>
+          <div class="dictation-label"><strong>选择一次作答</strong><span>{{ currentAttempts().length }} 条有效</span></div>
           <var-select v-model="teacherAttemptId" placeholder="选择作答">
-            <var-option v-for="attempt in state.attempts" :key="attempt.id" :label="`${attempt.lessonTitle} · ${attempt.score} 分 · ${formatDate(attempt.submittedAt)}`" :value="attempt.id" />
+            <var-option v-for="attempt in state.attempts" :key="attempt.id" :label="`${attempt.lessonTitle} · ${attempt.score} 分 · ${formatDate(attempt.submittedAt)}${isAttemptStale(attempt) ? '（已失效）' : ''}`" :value="attempt.id" />
           </var-select>
           <template v-if="teacherAttempt">
+            <div v-if="teacherStale" class="feedback-card stale-teacher"><strong>该记录已失效</strong><p>学生在提交后改动了答案或合并了另一台设备的草稿。逐词结果与反馈均绑定旧答案，请等学生用当前答案重新确认后再写反馈。</p></div>
             <div class="feedback-card"><strong>{{ teacherAttempt.courseTitle }}</strong><p>{{ teacherAttempt.lessonTitle }} · 总分 {{ teacherAttempt.score }}，完成 {{ teacherAttempt.sentenceAttempts.length }} 句。</p></div>
             <div class="teacher-editor">
-              <textarea v-model="teacherDraft" placeholder="给学生一条具体、可执行的反馈..." aria-label="教师反馈"></textarea>
-              <var-button block type="primary" style="margin-top: 10px" @click="saveTeacherFeedback">保存反馈</var-button>
+              <textarea v-model="teacherDraft" :disabled="teacherStale" placeholder="给学生一条具体、可执行的反馈..." aria-label="教师反馈"></textarea>
+              <var-button block type="primary" style="margin-top: 10px" :disabled="teacherStale" @click="saveTeacherFeedback">保存反馈</var-button>
             </div>
           </template>
         </div>

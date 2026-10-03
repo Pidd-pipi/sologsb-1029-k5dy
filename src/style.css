@@ -122,6 +122,26 @@ button, input, textarea { font: inherit; }
 .segmented button.active { background: var(--card); color: var(--text); box-shadow: 0 1px 5px rgb(0 0 0 / .09); font-weight: 700; }
 .empty-state { text-align: center; padding: 36px 20px; color: var(--muted); }
 .empty-state strong { display: block; color: var(--text); margin-bottom: 7px; }
+.sync-panel { border-color: color-mix(in srgb, var(--primary) 35%, var(--line)); }
+.sync-hint { color: var(--muted); font-size: .72rem; line-height: 1.6; margin: 0 0 12px; }
+.sync-actions { display: flex; gap: 9px; }
+.sync-actions > * { flex: 1; }
+.conflict-card { background: color-mix(in srgb, var(--danger) 9%, var(--card)); border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--line)); border-radius: 18px; padding: 14px; margin-bottom: 12px; }
+.choice-row { display: block; width: 100%; text-align: left; border: 1.5px solid color-mix(in srgb, var(--danger) 35%, var(--line)); background: var(--card); color: var(--text); border-radius: 13px; padding: 10px 12px; margin-top: 8px; cursor: pointer; }
+.choice-row:active { border-color: var(--danger); }
+.choice-device { display: block; font-size: .64rem; color: var(--danger); font-weight: 700; margin-bottom: 4px; }
+.choice-text { display: block; font-size: .8rem; line-height: 1.55; }
+.conflict-note { margin: 9px 2px 0; font-size: .66rem; color: var(--muted); }
+.conflict-summary { text-align: center; color: var(--danger); font-size: .7rem; margin: 4px 0 0; }
+.sentence-dot.conflict { border-color: var(--danger); color: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 18%, transparent); }
+.stale-tag { display: inline-block; margin-left: 6px; padding: 2px 7px; border-radius: 999px; background: color-mix(in srgb, var(--danger) 13%, transparent); color: var(--danger); font-size: .6rem; font-weight: 700; }
+.status-chip.status-stale { background: color-mix(in srgb, var(--danger) 13%, transparent); color: var(--danger); }
+.stale-panel { border-color: color-mix(in srgb, var(--danger) 35%, var(--line)); }
+.stale-panel strong { display: block; font-size: .86rem; }
+.stale-panel p { color: var(--muted); font-size: .73rem; line-height: 1.6; margin: 8px 0 13px; }
+.score-ring.dimmed { opacity: .45; filter: grayscale(.4); }
+.feedback-stale { opacity: .65; border-left-color: var(--danger); }
+.stale-teacher { border-left-color: var(--danger); }
 @media (min-width: 600px) {
   body { padding: 18px 0; }
   .app-shell { min-height: calc(100dvh - 36px); border-radius: 28px; }
