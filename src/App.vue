@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { courseForLesson, exportRecords, lessonById, persist, saveAttempt, setDownloaded, state, updateTokenClassification } from './store';
-import type { ErrorCategory, Lesson, PracticeAttempt, PracticeView } from './types';
+import { courseForLesson, createProgress, exportRecords, lessonById, persist, resolveConflict, saveAttempt, setDownloaded, state, syncNow, touchAnswer, updateTokenClassification } from './store';
+import { CLOUD_KEY, getDeviceId } from './sync';
+import type { DraftConflict, DraftConflictOption, ErrorCategory, Lesson, PracticeAttempt, PracticeView } from './types';
 import { compareSentence, scoreAttempt, segmentText } from './utils';
 
 const view = ref<PracticeView>(state.activeLessonId ? 'practice' : 'library');
@@ -13,6 +14,7 @@ const segmentStart = ref(0);
 const segmentEnd = ref(1);
 const teacherAttemptId = ref(state.attempts[0]?.id ?? '');
 const teacherDraft = ref(state.attempts[0]?.teacherFeedback ?? '');
+const myDeviceId = getDeviceId();
 let toastTimer = 0;
 
 const activeLesson = computed(() => lessonById(state.activeLessonId));
@@ -36,8 +38,17 @@ const lessonCompletion = computed(() => {
 const resultAttempt = computed(() => state.attempts.find((attempt) => attempt.id === resultAttemptId.value));
 const resultSentence = computed(() => resultAttempt.value?.sentenceAttempts[selectedResultSentence.value]);
 const teacherAttempt = computed(() => state.attempts.find((attempt) => attempt.id === teacherAttemptId.value));
-const totalWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).length);
-const correctedWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).filter((token) => !token.correct && token.category !== 'unclassified').length);
+const validAttemptList = computed(() => state.attempts.filter((attempt) => attempt.status === 'valid'));
+const staleCount = computed(() => state.attempts.length - validAttemptList.value.length);
+const totalWords = computed(() => validAttemptList.value.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).length);
+const correctedWords = computed(() => validAttemptList.value.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).filter((token) => !token.correct && token.category !== 'unclassified').length);
+const activeConflicts = computed(() => activeProgress.value?.conflicts ?? []);
+const pendingConflictCount = computed(() => Object.values(state.progress).reduce((sum, progress) => sum + (progress.conflicts?.length ?? 0), 0));
+const latestAttemptStale = computed(() => {
+  const lesson = activeLesson.value;
+  if (!lesson) return false;
+  return state.attempts.find((attempt) => attempt.lessonId === lesson.id)?.status === 'stale';
+});
 
 const categoryOptions: Array<{ value: ErrorCategory; label: string }> = [
   { value: 'unclassified', label: '未分类' },
@@ -58,18 +69,16 @@ watch(currentAnswer, (value) => {
   const lesson = activeLesson.value;
   const sentence = currentSentence.value;
   if (!lesson || !sentence) return;
-  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: sentence.id, updatedAt: new Date().toISOString() };
-  progress.answers[sentence.id] = value;
+  const progress = state.progress[lesson.id] ?? createProgress(lesson.id);
   progress.activeSentenceId = sentence.id;
-  progress.updatedAt = new Date().toISOString();
   state.progress[lesson.id] = progress;
+  touchAnswer(lesson.id, sentence.id, value);
 });
 
 watch(activeLesson, (lesson) => {
   if (!lesson) return;
   state.activeLessonId = lesson.id;
-  state.activeSentenceId = currentSentence.value?.id ?? lesson.sentences[0].id;
-  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: lesson.sentences[0].id, updatedAt: new Date().toISOString() };
+  const progress = state.progress[lesson.id] ?? createProgress(lesson.id);
   if (!lesson.sentences.some((sentence) => sentence.id === progress.activeSentenceId)) progress.activeSentenceId = lesson.sentences[0].id;
   state.progress[lesson.id] = progress;
   state.activeSentenceId = progress.activeSentenceId;
@@ -87,7 +96,7 @@ function notify(message: string) {
 }
 
 function startLesson(lesson: Lesson) {
-  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: lesson.sentences[0].id, updatedAt: new Date().toISOString() };
+  const progress = state.progress[lesson.id] ?? createProgress(lesson.id);
   state.progress[lesson.id] = progress;
   state.activeLessonId = lesson.id;
   state.activeSentenceId = progress.activeSentenceId || lesson.sentences[0].id;
@@ -136,7 +145,9 @@ function submitLesson() {
     submittedAt: new Date().toISOString(),
     score: scoreAttempt(sentenceAttempts),
     sentenceAttempts,
-    teacherFeedback: ''
+    teacherFeedback: '',
+    status: 'valid',
+    draftRevision: progress?.revision ?? 0
   };
   saveAttempt(attempt);
   resultAttemptId.value = attempt.id;
@@ -190,6 +201,47 @@ function saveTeacherFeedback() {
   notify('教师反馈已保存');
 }
 
+function runSync(manual = false) {
+  const summary = syncNow();
+  // 合并可能自动接上了对方修改的句子，刷新当前输入框
+  const lesson = activeLesson.value;
+  const sentence = currentSentence.value;
+  if (lesson && sentence) currentAnswer.value = state.progress[lesson.id]?.answers[sentence.id] ?? '';
+  if (summary.applied + summary.pushed + summary.conflicts === 0) {
+    if (manual) notify('草稿已是最新，没有新的改动');
+    return;
+  }
+  const parts: string[] = [];
+  if (summary.applied) parts.push(`自动接上 ${summary.applied} 句`);
+  if (summary.pushed) parts.push(`上传 ${summary.pushed} 句`);
+  if (summary.conflicts) parts.push(`${summary.conflicts} 处冲突待选择`);
+  notify(`同步完成：${parts.join('，')}`);
+}
+
+function chooseConflictOption(conflict: DraftConflict, option: DraftConflictOption) {
+  if (!resolveConflict(conflict.lessonId, conflict.id, option.value)) return;
+  if (conflict.sentenceId === state.activeSentenceId) currentAnswer.value = option.value;
+  notify('已采用所选答案，冲突已解决');
+}
+
+function deviceLabel(updatedBy: string): string {
+  if (!updatedBy) return '未知设备';
+  if (updatedBy === myDeviceId) return '本机';
+  if (updatedBy === 'legacy') return '升级前数据';
+  return '另一台设备';
+}
+
+function sentenceIndexOf(sentenceId: string): number {
+  const lesson = activeLesson.value;
+  return lesson ? lesson.sentences.findIndex((item) => item.id === sentenceId) : -1;
+}
+
+function goToFirstConflictLesson() {
+  const entry = Object.entries(state.progress).find(([, progress]) => progress.conflicts?.length);
+  const lesson = entry ? lessonById(entry[0]) : undefined;
+  if (lesson) startLesson(lesson);
+}
+
 function toggleTheme() {
   state.theme = state.theme === 'light' ? 'dark' : 'light';
 }
@@ -206,32 +258,47 @@ function downloadRecords() {
   anchor.download = `echo-step-records-${new Date().toISOString().slice(0, 10)}.json`;
   anchor.click();
   URL.revokeObjectURL(url);
-  notify('练习记录已导出');
+  notify(staleCount.value ? `练习记录已导出（已排除 ${staleCount.value} 条失效记录）` : '练习记录已导出');
 }
 
 function formatDate(value: string): string {
-  return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '时间未知';
+  return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
 function onConnectionChange() {
+  const wasOffline = !online.value;
   online.value = navigator.onLine;
   persist();
+  // 回网后自动做一次逐句合并，不再整份覆盖
+  if (wasOffline && online.value) runSync();
+}
+
+function onStorage(event: StorageEvent) {
+  // 另一台设备（或另一标签页）更新了云端草稿时即时合并
+  if (event.key === CLOUD_KEY) runSync();
 }
 
 function onVisibilityChange() {
   if (document.visibilityState === 'hidden') persist();
+  // 切回应用且在线时也做一次合并，多端改动及时接上
+  if (document.visibilityState === 'visible' && navigator.onLine) runSync();
 }
 
 onMounted(() => {
   window.addEventListener('online', onConnectionChange);
   window.addEventListener('offline', onConnectionChange);
+  window.addEventListener('storage', onStorage);
   window.addEventListener('visibilitychange', onVisibilityChange);
   window.addEventListener('pagehide', persist);
+  if (navigator.onLine) runSync();
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener('online', onConnectionChange);
   window.removeEventListener('offline', onConnectionChange);
+  window.removeEventListener('storage', onStorage);
   window.removeEventListener('visibilitychange', onVisibilityChange);
   window.removeEventListener('pagehide', persist);
   persist();
@@ -258,15 +325,20 @@ onBeforeUnmount(() => {
           <h2>今天也把声音变成文字</h2>
           <p>下载课程后可离线作答，答案和当前位置会自动恢复。</p>
           <div class="hero-stats">
-            <div class="hero-stat"><strong>{{ state.attempts.length }}</strong><span>练习记录</span></div>
+            <div class="hero-stat"><strong>{{ validAttemptList.length }}</strong><span>有效记录</span></div>
             <div class="hero-stat"><strong>{{ correctedWords }}</strong><span>已分类错误</span></div>
             <div class="hero-stat"><strong>{{ totalWords }}</strong><span>累计词数</span></div>
           </div>
+          <p v-if="staleCount" class="hero-note">{{ staleCount }} 条旧记录因答案被修改已失效，重新提交确认后才会恢复统计与导出。</p>
         </section>
 
         <div class="offline-banner" :class="{ online }">
           <span>{{ online ? '● 在线 · 数据已保存到本机' : '● 离线模式 · 可继续已下载课程' }}</span>
-          <span>{{ online ? '本地优先存储' : '恢复网络后继续保存' }}</span>
+          <button v-if="online" class="sync-button" type="button" @click="runSync(true)">同步草稿{{ state.lastSyncAt ? ` · ${formatDate(state.lastSyncAt)}` : '' }}</button>
+          <span v-else>恢复网络后继续保存</span>
+        </div>
+        <div v-if="pendingConflictCount" class="conflict-reminder" role="button" tabindex="0" @click="goToFirstConflictLesson" @keydown.enter="goToFirstConflictLesson">
+          有 {{ pendingConflictCount }} 处同步冲突：同一句在多台设备上各改过一次，点这里逐句选择 ›
         </div>
 
         <div class="section-head">
@@ -291,11 +363,11 @@ onBeforeUnmount(() => {
           </div>
         </article>
 
-        <div class="section-head"><h3>最近练习</h3><span>{{ state.attempts.length }} 条记录</span></div>
+        <div class="section-head"><h3>最近练习</h3><span>{{ validAttemptList.length }} 条有效<template v-if="staleCount"> · {{ staleCount }} 条已失效</template></span></div>
         <article v-if="state.attempts.length" class="panel">
           <div v-for="attempt in state.attempts.slice(0, 4)" :key="attempt.id" class="history-card">
             <div class="history-top"><strong>{{ attempt.lessonTitle }}</strong><span class="history-score">{{ attempt.score }} 分</span></div>
-            <p>{{ formatDate(attempt.submittedAt) }} · {{ attempt.teacherFeedback || '暂无教师反馈' }}</p>
+            <p>{{ formatDate(attempt.submittedAt) }} · {{ attempt.teacherFeedback || '暂无教师反馈' }} <span v-if="attempt.status === 'stale'" class="stale-badge">已失效</span></p>
           </div>
           <var-button block type="primary" variant="outline" @click="downloadRecords">导出全部练习记录</var-button>
         </article>
@@ -307,6 +379,7 @@ onBeforeUnmount(() => {
           <div class="practice-nav">
             <button class="back-button" aria-label="返回课程库" @click="view = 'library'">‹</button>
             <div><h2>{{ activeLesson.title }}</h2></div>
+            <span v-if="activeConflicts.length" class="status-chip conflict-chip">{{ activeConflicts.length }} 处冲突</span>
             <span class="status-chip">{{ online ? '在线' : '离线' }}</span>
           </div>
           <div class="progress-line">
@@ -319,6 +392,25 @@ onBeforeUnmount(() => {
           <div class="audio-meta">
             <button class="play-button" aria-label="播放当前句子" @click="replay(currentSentence?.text ?? '')">▶</button>
             <div><strong>听写提示</strong><p>先完整播放，再输入你听到的英文。播放速度已放慢。</p></div>
+          </div>
+        </section>
+
+        <div v-if="latestAttemptStale" class="stale-banner">答案在提交后又修改过，此前的逐词结果与教师反馈已失效；重新提交确认前不会进入统计与导出。</div>
+
+        <section v-if="activeConflicts.length" class="panel conflict-panel">
+          <div class="detail-head">
+            <div><h3>同步冲突 · {{ activeConflicts.length }} 处</h3><p>同一句在两台设备上各改过一次，整份草稿不再互相覆盖——请逐句选择要保留的一份。</p></div>
+          </div>
+          <div v-for="conflict in activeConflicts" :key="conflict.id" class="conflict-item">
+            <div class="conflict-title">第 {{ sentenceIndexOf(conflict.sentenceId) + 1 }} 句</div>
+            <div v-for="option in conflict.options" :key="option.source" class="conflict-option">
+              <div class="conflict-meta">
+                <strong>{{ option.source === 'local' ? '本机草稿' : '云端草稿' }}</strong>
+                <span>{{ deviceLabel(option.updatedBy) }}<template v-if="option.updatedAt"> · {{ formatDate(option.updatedAt) }}</template></span>
+              </div>
+              <p class="conflict-value">{{ option.value || '（空答案）' }}</p>
+              <var-button size="small" type="primary" variant="outline" @click="chooseConflictOption(conflict, option)">采用这份</var-button>
+            </div>
           </div>
         </section>
 
@@ -345,6 +437,8 @@ onBeforeUnmount(() => {
           <span class="status-chip">提交于 {{ formatDate(resultAttempt.submittedAt) }}</span>
           <button class="icon-button" @click="downloadRecords">导出</button>
         </header>
+
+        <div v-if="resultAttempt.status === 'stale'" class="stale-banner">该记录已失效：答案在提交后被修改，统计与导出不再包含它；重新提交后会生成新的有效记录。</div>
 
         <section class="panel result-score">
           <div class="score-ring" :style="{ '--score': `${resultAttempt.score}%` }"><strong>{{ resultAttempt.score }}</strong></div>
@@ -404,10 +498,11 @@ onBeforeUnmount(() => {
         <div v-if="state.attempts.length" class="panel">
           <div class="dictation-label"><strong>选择一次作答</strong><span>{{ state.attempts.length }} 条</span></div>
           <var-select v-model="teacherAttemptId" placeholder="选择作答">
-            <var-option v-for="attempt in state.attempts" :key="attempt.id" :label="`${attempt.lessonTitle} · ${attempt.score} 分 · ${formatDate(attempt.submittedAt)}`" :value="attempt.id" />
+            <var-option v-for="attempt in state.attempts" :key="attempt.id" :label="`${attempt.lessonTitle} · ${attempt.score} 分 · ${formatDate(attempt.submittedAt)}${attempt.status === 'stale' ? '（已失效）' : ''}`" :value="attempt.id" />
           </var-select>
           <template v-if="teacherAttempt">
             <div class="feedback-card"><strong>{{ teacherAttempt.courseTitle }}</strong><p>{{ teacherAttempt.lessonTitle }} · 总分 {{ teacherAttempt.score }}，完成 {{ teacherAttempt.sentenceAttempts.length }} 句。</p></div>
+            <p v-if="teacherAttempt.status === 'stale'" class="stale-note">该作答已失效（学生改动了答案），反馈仍绑定这条记录保存，但不再进入统计与导出。</p>
             <div class="teacher-editor">
               <textarea v-model="teacherDraft" placeholder="给学生一条具体、可执行的反馈..." aria-label="教师反馈"></textarea>
               <var-button block type="primary" style="margin-top: 10px" @click="saveTeacherFeedback">保存反馈</var-button>

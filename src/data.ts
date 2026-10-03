@@ -65,7 +65,7 @@ export const demoCourses: Course[] = [
 ];
 
 export const createInitialState = (): PersistedState => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
   courses: structuredClone(demoCourses),
   attempts: [
     {
@@ -75,6 +75,8 @@ export const createInitialState = (): PersistedState => ({
       courseTitle: '日常英语 · 机场与出行',
       submittedAt: '2026-09-24T10:20:00.000Z',
       score: 84,
+      status: 'valid',
+      draftRevision: 0,
       teacherFeedback: '连读细节明显进步。注意 bags are 的词尾衔接，再听一遍第二句。',
       sentenceAttempts: [
         {
@@ -103,12 +105,19 @@ export const createInitialState = (): PersistedState => ({
     'airport-01': {
       answers: { 'airport-01-s1': 'I would like to check in for my flight to London' },
       activeSentenceId: 'airport-01-s2',
-      updatedAt: '2026-09-24T10:10:00.000Z'
+      updatedAt: '2026-09-24T10:10:00.000Z',
+      revision: 0,
+      sentenceMeta: {
+        'airport-01-s1': { updatedAt: '2026-09-24T10:10:00.000Z', updatedBy: 'legacy' }
+      },
+      syncBase: {},
+      conflicts: []
     }
   },
   activeLessonId: '',
   activeSentenceId: '',
   theme: 'light',
   fontScale: 1,
-  role: 'learner'
+  role: 'learner',
+  lastSyncAt: ''
 });

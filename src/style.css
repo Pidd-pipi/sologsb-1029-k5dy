@@ -69,7 +69,22 @@ button, input, textarea { font: inherit; }
 .lesson-row h4 { margin: 0; font-size: .9rem; }
 .lesson-row p { color: var(--muted); font-size: .7rem; margin: 5px 0 0; }
 .lesson-actions { display: flex; align-items: center; gap: 7px; }
-.stale-badge { display: inline-flex; align-items: center; gap: 4px; }
+.stale-badge { display: inline-flex; align-items: center; gap: 4px; border-radius: 999px; padding: 2px 8px; font-size: .62rem; font-weight: 700; background: color-mix(in srgb, var(--danger) 12%, var(--card)); color: var(--danger); }
+.stale-banner { border-radius: 13px; padding: 11px 13px; margin-bottom: 13px; background: color-mix(in srgb, var(--danger) 10%, var(--card)); border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--line)); color: var(--danger); font-size: .73rem; line-height: 1.55; }
+.stale-note { color: var(--danger); font-size: .7rem; line-height: 1.5; margin: 10px 2px 0; }
+.hero-note { font-size: .66rem; opacity: .85; margin: 12px 0 0; line-height: 1.5; }
+.sync-button { border: 0; background: transparent; color: inherit; font-weight: 700; font-size: .73rem; cursor: pointer; text-decoration: underline; padding: 0; }
+.conflict-reminder { border-radius: 13px; padding: 11px 13px; margin-bottom: 13px; background: #fff6dc; color: #795300; font-size: .73rem; line-height: 1.5; cursor: pointer; border: 1px solid #f0dfa8; }
+.conflict-chip { background: #fff3d6; color: #8a5a00; }
+.conflict-panel { border-color: color-mix(in srgb, #f0b429 45%, var(--line)); }
+.conflict-item { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
+.conflict-title { font-size: .8rem; font-weight: 700; }
+.conflict-option { background: var(--soft); border-radius: 12px; padding: 10px 12px; margin-top: 8px; }
+.conflict-meta { display: flex; justify-content: space-between; gap: 8px; font-size: .68rem; color: var(--muted); }
+.conflict-meta strong { color: var(--text); }
+.conflict-value { font-size: .8rem; margin: 6px 0 9px; line-height: 1.55; word-break: break-word; }
+[data-theme='dark'] .conflict-reminder { background: #3a2f12; color: #f0c96a; border-color: #5c4a1d; }
+[data-theme='dark'] .conflict-chip { background: #3a2f12; color: #f0c96a; }
 .offline-banner { display: flex; justify-content: space-between; align-items: center; border-radius: 13px; padding: 10px 12px; margin-bottom: 13px; background: #fff6dc; color: #795300; font-size: .73rem; }
 .offline-banner.online { background: #e9f8f2; color: #126c50; }
 .practice-header { position: sticky; top: 0; z-index: 8; margin: -18px -16px 16px; padding: max(16px, env(safe-area-inset-top)) 16px 14px; background: color-mix(in srgb, var(--app-bg) 92%, transparent); backdrop-filter: blur(16px); border-bottom: 1px solid var(--line); }
